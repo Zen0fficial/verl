@@ -340,6 +340,171 @@ class RayPPOTrainer:
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+    def _tokenize_keypoints(self, keypoints_per_sample):
+        """Tokenize key points per sample using the trainer tokenizer.
+
+        Expect `keypoints_per_sample` to be a sequence with length == batch size,
+        where each element is a sequence of strings (the key points for that sample).
+        """
+        tokenized: list[list[list[int]]] = []
+        for kp_list in keypoints_per_sample:
+            # Convert numpy/object arrays to python lists if needed
+            if kp_list is None:
+                tokenized.append([])
+                continue
+            if hasattr(kp_list, "tolist"):
+                kp_list = kp_list.tolist()
+            tk_list = []
+            for kp in kp_list:
+                if kp is None:
+                    continue
+                # Defensive: ensure string
+                kp_str = str(kp)
+                kp_ids = self.tokenizer.encode(kp_str, add_special_tokens=False)
+                if len(kp_ids) > 0:
+                    tk_list.append(kp_ids)
+            tokenized.append(tk_list)
+        return tokenized
+
+    def _compute_keypoint_reward_scores(self, batch: DataProto):
+        """Compute keypoint-based reward per the user's log-probability existence method.
+
+        Requirements:
+        - batch.non_tensor_batch["keypoints"]: list[list[str]] key points per sample
+        Returns:
+        - token_level_scores: torch.Tensor of shape (bs, response_length), reward placed on last generated token
+        - reward_extra_info: dict with auxiliary info
+        """
+        input_ids = batch.batch["input_ids"]
+        attention_mask = batch.batch["attention_mask"]
+        position_ids = batch.batch["position_ids"]
+        responses = batch.batch["responses"]
+        response_mask = batch.batch["response_mask"]
+        bs, response_len = responses.shape
+
+        keypoints_per_sample = batch.non_tensor_batch.get("keypoints", None)
+        if keypoints_per_sample is None:
+            # Fallback: zero reward
+            token_level_scores = torch.zeros_like(responses, dtype=torch.float32)
+            return token_level_scores, {}
+
+        tokenized_kps = self._tokenize_keypoints(keypoints_per_sample)
+
+        # Build variant batches for each (sample, keypoint, start_pos)
+        variants_input_ids = []
+        variants_attention_mask = []
+        variants_position_ids = []
+        variants_responses = []
+        # Mapping to reconstruct: (sample_idx, keypoint_idx, start_pos, k_len)
+        variant_meta = []
+
+        seq_len = input_ids.shape[1]
+        resp_start = seq_len - response_len
+
+        for s in range(bs):
+            k_list = tokenized_kps[s]
+            if not k_list:
+                continue
+            # Compute valid windows based on response_mask contiguity
+            row_mask = response_mask[s]  # (response_len,)
+            for k_idx, k_ids in enumerate(k_list):
+                k_len = len(k_ids)
+                if k_len == 0 or k_len > response_len:
+                    continue
+                # Identify valid start positions where all ones in the window
+                # Brute force scan; response_len is typically modest
+                for i in range(0, response_len - k_len + 1):
+                    if torch.all(row_mask[i : i + k_len] == 1):
+                        # Create modified copies for this variant
+                        ids_mod = input_ids[s].clone()
+                        resp_slice = slice(resp_start + i, resp_start + i + k_len)
+                        ids_mod[resp_slice] = torch.tensor(k_ids, dtype=ids_mod.dtype, device=ids_mod.device)
+
+                        resp_mod = responses[s].clone()
+                        resp_mod[i : i + k_len] = torch.tensor(k_ids, dtype=resp_mod.dtype, device=resp_mod.device)
+
+                        variants_input_ids.append(ids_mod)
+                        variants_attention_mask.append(attention_mask[s].clone())
+                        variants_position_ids.append(position_ids[s].clone())
+                        variants_responses.append(resp_mod)
+                        variant_meta.append((s, k_idx, i, k_len))
+
+        if len(variants_input_ids) == 0:
+            # No valid windows — produce zeros
+            token_level_scores = torch.zeros_like(responses, dtype=torch.float32)
+            return token_level_scores, {"kp_reward": [0.0 for _ in range(bs)]}
+
+        # Stack into a single DataProto for one batched forward
+        var_input_ids = torch.stack(variants_input_ids, dim=0)
+        var_attention_mask = torch.stack(variants_attention_mask, dim=0)
+        var_position_ids = torch.stack(variants_position_ids, dim=0)
+        var_responses = torch.stack(variants_responses, dim=0)
+
+        variants_dp = DataProto.from_dict(
+            tensors={
+                "input_ids": var_input_ids,
+                "attention_mask": var_attention_mask,
+                "position_ids": var_position_ids,
+                "responses": var_responses,
+            }
+        )
+
+        # Compute log-probs for the modified variants
+        mod_logprob_dp = self.actor_rollout_wg.compute_log_prob(variants_dp)
+        mod_log_probs = mod_logprob_dp.batch["old_log_probs"].to(torch.float32)  # (num_variants, response_len)
+
+        # Aggregate probabilities per (sample, keypoint) using the recurrence
+        # P_exist_i = P_exist_{i-1} + (1 - P_exist_{i-1}) * P(k, i)
+        # where P(k, i) = exp(sum log_probs over window)
+        # Prepare containers
+        p_exist_per_sk: dict[tuple[int, int], float] = {}
+        # Group variant indices by (s, k_idx) and sort by start position
+        grouped: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+        for idx, (s, k_idx, start_pos, k_len) in enumerate(variant_meta):
+            grouped.setdefault((s, k_idx), []).append((idx, start_pos, k_len))
+
+        for (s, k_idx), entries in grouped.items():
+            entries.sort(key=lambda t: t[1])
+            p_exist = 0.0
+            for idx, start_pos, k_len in entries:
+                window_lp = mod_log_probs[idx, start_pos : start_pos + k_len].sum().item()
+                # Convert to probability with numerical safety
+                p_ki = float(torch.exp(torch.tensor(window_lp)).clamp(max=1.0).item())
+                # Recurrence
+                p_exist = p_exist + (1.0 - p_exist) * p_ki
+                # Early exit if saturated
+                if p_exist >= 1.0:
+                    p_exist = 1.0
+                    break
+            p_exist_per_sk[(s, k_idx)] = p_exist
+
+        # Sum log existence probability across keypoints per sample
+        eps = 1e-12
+        seq_scores = torch.zeros((bs,), dtype=torch.float32)
+        for s in range(bs):
+            total = 0.0
+            # Count how many kps present for this sample
+            num_k = len(tokenized_kps[s])
+            if num_k == 0:
+                seq_scores[s] = 0.0
+                continue
+            for k_idx in range(num_k):
+                p_exist = p_exist_per_sk.get((s, k_idx), 0.0)
+                total += float(torch.log(torch.tensor(p_exist + eps)).item())
+            seq_scores[s] = total
+
+        # Place the sequence score on the last generated token position
+        token_level_scores = torch.zeros_like(responses, dtype=torch.float32)
+        # Find last index where response_mask == 1 per row
+        rev_mask = torch.flip(response_mask, dims=[1])
+        last_offsets = torch.argmax(rev_mask, dim=1)
+        last_idx = (response_mask.shape[1] - 1) - last_offsets
+        rows = torch.arange(bs)
+        token_level_scores[rows, last_idx] = seq_scores
+
+        reward_extra = {"kp_reward": seq_scores.detach().cpu().tolist()}
+        return token_level_scores, reward_extra
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
@@ -925,8 +1090,6 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
-        from omegaconf import OmegaConf
-
         from verl.utils.tracking import Tracking
 
         logger = Tracking(
@@ -1049,11 +1212,15 @@ class RayPPOTrainer:
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
-
+                    # If keypoints are provided, compute keypoint reward later (after log-probs)
+                    use_keypoint_reward = ("keypoints" in batch.non_tensor_batch)
+                    if not use_keypoint_reward:
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                    else:
+                        reward_tensor, reward_extra_infos_dict = None, {}
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1082,6 +1249,13 @@ class RayPPOTrainer:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
+                    # Compute keypoint reward here if enabled (after log-probs are ensured available)
+                    if use_keypoint_reward:
+                        with marked_timer("keypoint_reward", timing_raw, color="yellow"):
+                            kp_scores, kp_extra = self._compute_keypoint_reward_scores(batch)
+                            reward_tensor = kp_scores
+                            reward_extra_infos_dict.update(kp_extra)
+
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
@@ -1091,7 +1265,7 @@ class RayPPOTrainer:
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
+                        if self.config.reward_model.launch_reward_fn_async and not use_keypoint_reward:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
