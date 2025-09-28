@@ -1240,20 +1240,6 @@ class RayPPOTrainer:
                     # Enable keypoint reward via config flag; fall back to presence detection
                     use_keypoint_reward = bool(self.config.algorithm.get("use_keypoint_reward", False))
                     if not use_keypoint_reward:
-                        # If keypoints are provided (prefer extra_info), compute keypoint reward later (after log-probs)
-                        if "extra_info" in batch.non_tensor_batch:
-                            _ei = batch.non_tensor_batch["extra_info"]
-                            if hasattr(_ei, "tolist"):
-                                _ei = _ei.tolist()
-                            if isinstance(_ei, (list, tuple)) and len(_ei) > 0:
-                                for _e in _ei:
-                                    if isinstance(_e, dict) and ("keypoints" in _e) and _e["keypoints"]:
-                                        use_keypoint_reward = True
-                                        break
-                        # Backward compatibility: allow top-level 'keypoints'
-                        if (not use_keypoint_reward) and ("keypoints" in batch.non_tensor_batch):
-                            use_keypoint_reward = True
-                    if not use_keypoint_reward:
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
