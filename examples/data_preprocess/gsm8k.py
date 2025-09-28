@@ -65,6 +65,8 @@ if __name__ == "__main__":
 
             answer_raw = example.pop("answer")
             solution = extract_solution(answer_raw)
+            # Add keypoints dict extracted from the solution pattern after newline `#### number`
+            keypoints = {"answer": solution}
             data = {
                 "data_source": data_source,
                 "prompt": [
@@ -80,6 +82,7 @@ if __name__ == "__main__":
                     "index": idx,
                     "answer": answer_raw,
                     "question": question_raw,
+                    "keypoints": keypoints,
                 },
             }
             return data

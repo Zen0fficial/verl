@@ -11,5 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from .keypoint_utils import extract_keypoints_from_answer_str, inject_keypoints_from_extra_info
