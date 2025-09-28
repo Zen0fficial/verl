@@ -370,7 +370,7 @@ class RayPPOTrainer:
         """Compute keypoint-based reward per the user's log-probability existence method.
 
         Requirements:
-        - batch.non_tensor_batch["keypoints"]: list[list[str]] key points per sample
+        - batch.non_tensor_batch["extra_info"]: list[list[str]] key points per sample
         Returns:
         - token_level_scores: torch.Tensor of shape (bs, response_length), reward placed on last generated token
         - reward_extra_info: dict with auxiliary info
@@ -382,7 +382,18 @@ class RayPPOTrainer:
         response_mask = batch.batch["response_mask"]
         bs, response_len = responses.shape
 
-        keypoints_per_sample = batch.non_tensor_batch.get("keypoints", None)
+        # Prefer keypoints stored inside extra_info
+        keypoints_per_sample = None
+        if "extra_info" in batch.non_tensor_batch:
+            extra_info = batch.non_tensor_batch["extra_info"]
+            if hasattr(extra_info, "tolist"):
+                extra_info = extra_info.tolist()
+            # Expect a list of dicts per sample
+            if isinstance(extra_info, (list, tuple)) and len(extra_info) > 0:
+                keypoints_per_sample = [
+                    (ei.get("keypoints") if isinstance(ei, dict) else None) for ei in extra_info
+                ]
+
         if keypoints_per_sample is None:
             # Fallback: zero reward
             token_level_scores = torch.zeros_like(responses, dtype=torch.float32)
@@ -405,29 +416,43 @@ class RayPPOTrainer:
             k_list = tokenized_kps[s]
             if not k_list:
                 continue
-            # Compute valid windows based on response_mask contiguity
-            row_mask = response_mask[s]  # (response_len,)
+
+            # Optimized: Pre-compute valid start positions for all keypoints
             for k_idx, k_ids in enumerate(k_list):
                 k_len = len(k_ids)
                 if k_len == 0 or k_len > response_len:
                     continue
-                # Identify valid start positions where all ones in the window
-                # Brute force scan; response_len is typically modest
-                for i in range(0, response_len - k_len + 1):
-                    if torch.all(row_mask[i : i + k_len] == 1):
-                        # Create modified copies for this variant
-                        ids_mod = input_ids[s].clone()
-                        resp_slice = slice(resp_start + i, resp_start + i + k_len)
-                        ids_mod[resp_slice] = torch.tensor(k_ids, dtype=ids_mod.dtype, device=ids_mod.device)
 
-                        resp_mod = responses[s].clone()
-                        resp_mod[i : i + k_len] = torch.tensor(k_ids, dtype=resp_mod.dtype, device=resp_mod.device)
+                # Use convolution to find all valid start positions at once
+                row_mask_float = response_mask[s].float()
+                
+                # Create a convolution kernel to match the keypoint pattern
+                kernel = torch.ones(k_len, dtype=torch.float32, device=response_mask.device)
+                
+                # Find where the keypoint can start
+                conv_result = torch.nn.functional.conv1d(
+                    row_mask_float.view(1, 1, -1), 
+                    kernel.view(1, 1, -1), 
+                    padding="same"
+                )
+                
+                # Valid start positions are where the convolution result equals the keypoint length
+                valid_starts = (conv_result.squeeze() >= k_len).nonzero(as_tuple=True)[0]
 
-                        variants_input_ids.append(ids_mod)
-                        variants_attention_mask.append(attention_mask[s].clone())
-                        variants_position_ids.append(position_ids[s].clone())
-                        variants_responses.append(resp_mod)
-                        variant_meta.append((s, k_idx, i, k_len))
+                for i in valid_starts:
+                    # Create modified copies for this variant
+                    ids_mod = input_ids[s].clone()
+                    resp_slice = slice(resp_start + i, resp_start + i + k_len)
+                    ids_mod[resp_slice] = torch.tensor(k_ids, dtype=ids_mod.dtype, device=ids_mod.device)
+
+                    resp_mod = responses[s].clone()
+                    resp_mod[i : i + k_len] = torch.tensor(k_ids, dtype=resp_mod.dtype, device=resp_mod.device)
+
+                    variants_input_ids.append(ids_mod)
+                    variants_attention_mask.append(attention_mask[s].clone())
+                    variants_position_ids.append(position_ids[s].clone())
+                    variants_responses.append(resp_mod)
+                    variant_meta.append((s, k_idx, i, k_len))
 
         if len(variants_input_ids) == 0:
             # No valid windows — produce zeros
@@ -1212,8 +1237,20 @@ class RayPPOTrainer:
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
-                    # If keypoints are provided, compute keypoint reward later (after log-probs)
-                    use_keypoint_reward = ("keypoints" in batch.non_tensor_batch)
+                    # If keypoints are provided (prefer extra_info), compute keypoint reward later (after log-probs)
+                    use_keypoint_reward = False
+                    if "extra_info" in batch.non_tensor_batch:
+                        _ei = batch.non_tensor_batch["extra_info"]
+                        if hasattr(_ei, "tolist"):
+                            _ei = _ei.tolist()
+                        if isinstance(_ei, (list, tuple)) and len(_ei) > 0:
+                            for _e in _ei:
+                                if isinstance(_e, dict) and ("keypoints" in _e) and _e["keypoints"]:
+                                    use_keypoint_reward = True
+                                    break
+                    # Backward compatibility: allow top-level 'keypoints'
+                    if (not use_keypoint_reward) and ("keypoints" in batch.non_tensor_batch):
+                        use_keypoint_reward = True
                     if not use_keypoint_reward:
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
