@@ -382,6 +382,17 @@ class RayPPOTrainer:
         response_mask = batch.batch["response_mask"]
         bs, response_len = responses.shape
 
+        # Optional: print full decoded answers for quick monitoring
+        try:
+            valid_lens = response_mask.sum(dim=-1).tolist()
+            max_print = min(2, bs)
+            for i in range(max_print):
+                ids = responses[i][: valid_lens[i]]
+                text = self.tokenizer.decode(ids, skip_special_tokens=True)
+                print(f"[kp] full_answer[{i}]: {text}")
+        except Exception as _e:
+            print(f"[kp] full_answer decode error: {_e}")
+
         # Prefer keypoints stored inside extra_info
         keypoints_per_sample = None
         if "extra_info" in batch.non_tensor_batch:
@@ -400,6 +411,40 @@ class RayPPOTrainer:
             return token_level_scores, {}
 
         tokenized_kps = self._tokenize_keypoints(keypoints_per_sample)
+
+        # Build chain-of-thought (CoT) mask to exclude spans like <think> ... </think>
+        cot_start_tag = self.config.algorithm.get("cot_start_tag", "<think>")
+        cot_end_tag = self.config.algorithm.get("cot_end_tag", "</think>")
+        start_ids = self.tokenizer.encode(cot_start_tag, add_special_tokens=False) if cot_start_tag else []
+        end_ids = self.tokenizer.encode(cot_end_tag, add_special_tokens=False) if cot_end_tag else []
+
+        def _build_cot_mask(row_ids: torch.Tensor) -> torch.Tensor:
+            mask = torch.zeros_like(row_ids, dtype=torch.bool)
+            if not start_ids or not end_ids:
+                return mask
+            seq = row_ids.tolist()
+            i = 0
+            open_at = None
+            s_len = len(start_ids)
+            e_len = len(end_ids)
+            n = len(seq)
+            while i < n:
+                if s_len > 0 and i + s_len <= n and seq[i : i + s_len] == start_ids:
+                    open_at = i + s_len
+                    i += s_len
+                    continue
+                if open_at is not None and e_len > 0 and i + e_len <= n and seq[i : i + e_len] == end_ids:
+                    if open_at < i:
+                        mask[open_at:i] = True
+                    open_at = None
+                    i += e_len
+                    continue
+                i += 1
+            if open_at is not None and open_at < n:
+                mask[open_at:n] = True
+            return mask
+
+        cot_masks = torch.stack([_build_cot_mask(responses[s]) for s in range(bs)], dim=0).to(response_mask.device)
 
         # Build variant batches for each (sample, keypoint, start_pos)
         variants_input_ids = []
@@ -423,23 +468,27 @@ class RayPPOTrainer:
                 if k_len == 0 or k_len > response_len:
                     continue
 
-                # Use convolution to find all valid start positions at once
-                row_mask_float = response_mask[s].float()
-                
-                # Create a convolution kernel to match the keypoint pattern
-                kernel = torch.ones(k_len, dtype=torch.float32, device=response_mask.device)
-                
-                # Find where the keypoint can start
-                conv_result = torch.nn.functional.conv1d(
-                    row_mask_float.view(1, 1, -1), 
-                    kernel.view(1, 1, -1), 
-                    padding="same"
-                )
-                
-                # Valid start positions are where the convolution result equals the keypoint length
-                valid_starts = (conv_result.squeeze() >= k_len).nonzero(as_tuple=True)[0]
+                # Find valid start positions as contiguous, non-CoT, in-mask windows of length k_len
+                row_mask_bool = (response_mask[s] & (~cot_masks[s]))
+                valid_starts: list[int] = []
+                j = 0
+                while j < response_len:
+                    if row_mask_bool[j].item():
+                        run_start = j
+                        # advance to the end of this contiguous True run
+                        while j < response_len and row_mask_bool[j].item():
+                            j += 1
+                        run_end = j  # exclusive
+                        # enumerate all window starts fully contained in this run
+                        for start in range(run_start, run_end - k_len + 1):
+                            valid_starts.append(start)
+                    else:
+                        j += 1
 
                 for i in valid_starts:
+                    i = int(i)
+                    if i + k_len > response_len:
+                        continue
                     # Create modified copies for this variant
                     ids_mod = input_ids[s].clone()
                     resp_slice = slice(resp_start + i, resp_start + i + k_len)
