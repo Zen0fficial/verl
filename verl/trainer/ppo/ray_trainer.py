@@ -530,6 +530,66 @@ class RayPPOTrainer:
         reward_extra = {"kp_reward": seq_scores.detach().cpu().tolist()}
         return token_level_scores, reward_extra
 
+    def _extract_keypoints_from_answer_str(self, answer: str) -> list[str]:
+        """Extract GSM8K-style keypoint like "#### 18" from an answer string.
+
+        Returns a list of keypoint strings (usually length 1) or an empty list if not found.
+        """
+        try:
+            import re
+
+            # Capture everything after the prefix on the same line
+            m = re.search(r"^\s*####\s*(.+)$", answer, flags=re.MULTILINE)
+            if not m:
+                return []
+            val = m.group(1).strip()
+            if len(val) == 0:
+                return []
+            return [f"#### {val}"]
+        except Exception:
+            return []
+
+    def _inject_keypoints_from_extra_info(self, batch: DataProto):
+        """If available, extract GSM8K keypoints from extra_info['answer'] per-sample and
+        store them as both extra_info['keypoints'] and top-level non_tensor_batch['keypoints'].
+
+        This is a no-op if keypoints already exist at the top level.
+        """
+        if "keypoints" in batch.non_tensor_batch:
+            return
+
+        extras = batch.non_tensor_batch.get("extra_info", None)
+        batch_size = len(batch.batch)
+        if extras is None:
+            return
+
+        # Normalize to list for mutation
+        if hasattr(extras, "tolist"):
+            extras_list = extras.tolist()
+        else:
+            extras_list = list(extras)
+
+        keypoints_per_sample = []
+        for i in range(batch_size):
+            info = extras_list[i] if i < len(extras_list) else {}
+            info = {} if info is None else dict(info)
+
+            if "keypoints" in info and isinstance(info["keypoints"], list):
+                kps = info["keypoints"]
+            else:
+                ans = info.get("answer", None)
+                kps = self._extract_keypoints_from_answer_str(ans) if isinstance(ans, str) else []
+                info["keypoints"] = kps
+
+            keypoints_per_sample.append(kps)
+            extras_list[i] = info
+
+        # Write back mutations
+        import numpy as _np
+
+        batch.non_tensor_batch["extra_info"] = _np.array(extras_list, dtype=object)
+        batch.non_tensor_batch["keypoints"] = _np.array(keypoints_per_sample, dtype=object)
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
@@ -1218,6 +1278,9 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+
+                    # Inject GSM8K keypoints from extra_info['answer'] if present
+                    self._inject_keypoints_from_extra_info(batch)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
