@@ -1,20 +1,18 @@
 """
-Utilities for extracting and injecting key points into PPO training batches.
+Utilities for extracting and injecting key points for PPO training.
 
 This module provides helpers to extract GSM8K-style key points from
 extra_info['answer'] (e.g., lines beginning with a specific prefix like
-"#### ") and to store the results in both extra_info['keypoints'] and
-top-level non-tensor batch under key 'keypoints'.
+"#### ") and to store the results back into data containers.
 """
 
 from __future__ import annotations
 
 import re
-from typing import List, Optional
+from typing import List, Optional, Iterable
 
 import numpy as np
-
-from verl import DataProto
+import pandas as pd
 
 
 def extract_keypoints_from_answer_str(answer: Optional[str], prefix: str = "####") -> List[str]:
@@ -47,50 +45,64 @@ def extract_keypoints_from_answer_str(answer: Optional[str], prefix: str = "####
         return []
 
 
-def inject_keypoints_from_extra_info(batch: DataProto, prefix: str = "####") -> None:
-    """Inject extracted key points into the batch in-place.
+def inject_keypoints_into_extra_info(extra_info: dict, prefix: str = "####") -> dict:
+    """Return a new extra_info dict with keypoints extracted from 'answer'.
 
-    This function looks for per-sample "answer" strings under
-    batch.non_tensor_batch['extra_info'] and creates per-sample key points
-    by calling `extract_keypoints_from_answer_str`. The resulting list is
-    stored in both extra_info['keypoints'] and the top-level
-    non_tensor_batch['keypoints'].
-
-    If top-level 'keypoints' already exists, this function is a no-op.
-
-    Args:
-        batch: The DataProto batch to modify in place.
-        prefix: The prefix used in answer strings to denote the final answer.
+    If 'keypoints' already exists and is a list, it is preserved.
     """
-    if "keypoints" in batch.non_tensor_batch:
-        return
+    info = {} if extra_info is None else dict(extra_info)
+    if isinstance(info.get("keypoints"), list):
+        return info
+    keypoints = extract_keypoints_from_answer_str(info.get("answer"), prefix=prefix)
+    info["keypoints"] = keypoints
+    return info
 
-    extras = batch.non_tensor_batch.get("extra_info", None)
-    if extras is None:
-        return
 
-    batch_size = len(batch.batch)
-    if hasattr(extras, "tolist"):
-        extras_list = extras.tolist()
+def annotate_dataframe_with_keypoints(
+    df: pd.DataFrame,
+    extra_info_col: str = "extra_info",
+    keypoints_col: Optional[str] = None,
+    prefix: str = "####",
+    inplace: bool = False,
+) -> pd.DataFrame:
+    """Annotate a pandas DataFrame with extracted key points.
+
+    - Reads per-row dicts from `extra_info_col` (each should contain 'answer').
+    - Writes back 'keypoints' into those dicts.
+    - Optionally writes the extracted list to a separate column `keypoints_col`.
+
+    Returns the modified DataFrame (or a copy if inplace=False).
+    """
+    if not inplace:
+        df = df.copy()
+
+    if extra_info_col not in df.columns:
+        raise KeyError(f"Column '{extra_info_col}' not found in DataFrame")
+
+    def _process_info(x):
+        return inject_keypoints_into_extra_info(x, prefix=prefix)
+
+    # Apply to the column; accept scalars or arrays of dicts
+    if isinstance(df[extra_info_col].iloc[0], (list, tuple, np.ndarray)):
+        # If extra_info is a sequence per row, process element-wise
+        def _process_seq(seq: Iterable):
+            seq = [] if seq is None else list(seq)
+            return [inject_keypoints_into_extra_info(elem, prefix=prefix) for elem in seq]
+
+        df[extra_info_col] = df[extra_info_col].apply(_process_seq)
     else:
-        extras_list = list(extras)
+        df[extra_info_col] = df[extra_info_col].apply(_process_info)
 
-    keypoints_per_sample: List[List[str]] = []
-    for i in range(batch_size):
-        info = extras_list[i] if i < len(extras_list) else {}
-        info = {} if info is None else dict(info)
+    if keypoints_col is not None:
+        def _extract_kps_from_info(x):
+            if isinstance(x, dict):
+                return x.get("keypoints", [])
+            if isinstance(x, (list, tuple, np.ndarray)):
+                return [d.get("keypoints", []) for d in x]
+            return []
 
-        if "keypoints" in info and isinstance(info["keypoints"], list):
-            kps = info["keypoints"]
-        else:
-            ans = info.get("answer", None)
-            kps = extract_keypoints_from_answer_str(ans, prefix=prefix)
-            info["keypoints"] = kps
+        df[keypoints_col] = df[extra_info_col].apply(_extract_kps_from_info)
 
-        keypoints_per_sample.append(kps)
-        extras_list[i] = info
-
-    batch.non_tensor_batch["extra_info"] = np.array(extras_list, dtype=object)
-    batch.non_tensor_batch["keypoints"] = np.array(keypoints_per_sample, dtype=object)
+    return df
 
 
