@@ -113,6 +113,10 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Whether to use keypoint-based reward. When True, trainer will compute
+  # rewards from log-probability existence of keypoints (if provided)
+  use_keypoint_reward: False
+
 # config for the trainer
 trainer:
 
