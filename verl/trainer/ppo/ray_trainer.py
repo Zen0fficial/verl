@@ -582,6 +582,12 @@ class RayPPOTrainer:
         rows = torch.arange(bs)
         token_level_scores[rows, last_idx] = seq_scores
 
+        # Print final reward for monitoring
+        try:
+            print(f"[kp] final_reward: {seq_scores.detach().cpu().tolist()}")
+        except Exception as _e:
+            print(f"[kp] final_reward print error: {_e}")
+
         reward_extra = {"kp_reward": seq_scores.detach().cpu().tolist()}
         return token_level_scores, reward_extra
 
