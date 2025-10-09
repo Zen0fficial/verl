@@ -532,28 +532,34 @@ class RayPPOTrainer:
         # where P(k, i) = exp(sum log_probs over window)
         # Prepare containers
         p_exist_per_sk: dict[tuple[int, int], float] = {}
-        # Group variant indices by (s, k_idx) and sort by start position
-        grouped: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
-        for idx, (s, k_idx, start_pos, k_len) in enumerate(variant_meta):
-            grouped.setdefault((s, k_idx), []).append((idx, start_pos, k_len))
 
-        for (s, k_idx), entries in grouped.items():
-            entries.sort(key=lambda t: t[1])
-            p_exist = 0.0
-            for idx, start_pos, k_len in entries:
+        # Single pass over variant_meta leveraging its creation order:
+        # for each (sample, keypoint), entries are appended by increasing start_pos.
+        current_key = None
+        current_p_exist = 0.0
+
+        for idx, (s, k_idx, start_pos, k_len) in enumerate(variant_meta):
+            key = (s, k_idx)
+            if key != current_key:
+                if current_key is not None:
+                    p_exist_per_sk[current_key] = current_p_exist
+                current_key = key
+                current_p_exist = 0.0
+
+            if current_p_exist < 1.0:
                 window_lp = mod_log_probs[idx, start_pos : start_pos + k_len].sum().item()
                 # Convert to probability with numerical safety
                 p_ki = float(torch.exp(torch.tensor(window_lp)).clamp(max=1.0).item())
                 # Recurrence
-                p_exist = p_exist + (1.0 - p_exist) * p_ki
-                # Early exit if saturated
-                if p_exist >= 1.0:
-                    p_exist = 1.0
-                    break
-            p_exist_per_sk[(s, k_idx)] = p_exist
+                current_p_exist = current_p_exist + (1.0 - current_p_exist) * p_ki
+                if current_p_exist >= 1.0:
+                    current_p_exist = 1.0
 
-        # Sum log existence probability across keypoints per sample
-        eps = 1e-12
+        # Flush the last key
+        if current_key is not None:
+            p_exist_per_sk[current_key] = current_p_exist
+
+        # Sum existence probability across keypoints per sample
         seq_scores = torch.zeros((bs,), dtype=torch.float32)
         for s in range(bs):
             total = 0.0
@@ -564,7 +570,7 @@ class RayPPOTrainer:
                 continue
             for k_idx in range(num_k):
                 p_exist = p_exist_per_sk.get((s, k_idx), 0.0)
-                total += float(torch.log(torch.tensor(p_exist + eps)).item())
+                total += p_exist
             seq_scores[s] = total
 
         # Place the sequence score on the last generated token position
