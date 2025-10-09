@@ -393,6 +393,12 @@ class RayPPOTrainer:
         except Exception as _e:
             print(f"[kp] full_answer decode error: {_e}")
 
+        # Debug controls for printing variants and probabilities
+        debug_print_variants = bool(self.config.algorithm.get("kp_debug_print_variants", False))
+        debug_sample_idx = int(self.config.algorithm.get("kp_debug_sample_idx", 0))
+        if debug_sample_idx < 0 or debug_sample_idx >= bs:
+            debug_sample_idx = 0
+
         # Prefer keypoints stored inside extra_info
         keypoints_per_sample = None
         if "extra_info" in batch.non_tensor_batch:
@@ -542,6 +548,11 @@ class RayPPOTrainer:
             key = (s, k_idx)
             if key != current_key:
                 if current_key is not None:
+                    if debug_print_variants and current_key[0] == debug_sample_idx:
+                        try:
+                            print(f"[kp] keypoint final s={current_key[0]} k={current_key[1]} p_exist={current_p_exist:.6f}")
+                        except Exception as _e:
+                            print(f"[kp] keypoint final print error: {_e}")
                     p_exist_per_sk[current_key] = current_p_exist
                 current_key = key
                 current_p_exist = 0.0
@@ -552,11 +563,28 @@ class RayPPOTrainer:
                 p_ki = float(torch.exp(torch.tensor(window_lp)).clamp(max=1.0).item())
                 # Recurrence
                 current_p_exist = current_p_exist + (1.0 - current_p_exist) * p_ki
+                if debug_print_variants and s == debug_sample_idx:
+                    try:
+                        seg_ids = variants_responses[idx][start_pos : start_pos + k_len]
+                        seg_text = self.tokenizer.decode(seg_ids, skip_special_tokens=True)
+                    except Exception as _e:
+                        seg_text = f"<decode_error:{_e}>"
+                    try:
+                        print(
+                            f"[kp] variant s={s} k={k_idx} start={start_pos} p_ki={p_ki:.6f} cum={current_p_exist:.6f} seg='{seg_text}'"
+                        )
+                    except Exception as _e:
+                        print(f"[kp] variant print error: {_e}")
                 if current_p_exist >= 1.0:
                     current_p_exist = 1.0
 
         # Flush the last key
         if current_key is not None:
+            if debug_print_variants and current_key[0] == debug_sample_idx:
+                try:
+                    print(f"[kp] keypoint final s={current_key[0]} k={current_key[1]} p_exist={current_p_exist:.6f}")
+                except Exception as _e:
+                    print(f"[kp] keypoint final print error: {_e}")
             p_exist_per_sk[current_key] = current_p_exist
 
         # Sum existence probability across keypoints per sample
