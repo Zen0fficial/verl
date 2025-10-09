@@ -526,7 +526,8 @@ class RayPPOTrainer:
                 "attention_mask": var_attention_mask,
                 "position_ids": var_position_ids,
                 "responses": var_responses,
-            }
+            },
+            auto_padding=True,
         )
 
         # Compute log-probs for the modified variants
