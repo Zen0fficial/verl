@@ -463,38 +463,36 @@ class RayPPOTrainer:
         seq_len = input_ids.shape[1]
         resp_start = seq_len - response_len
 
+        # If a marker string is provided (default "####"), only build variants at marker positions
+        marker_string = self.config.algorithm.get("kp_marker_string", "####")
+        marker_ids = self.tokenizer.encode(marker_string, add_special_tokens=False) if marker_string else []
+        marker_len = len(marker_ids)
+
         for s in range(bs):
             k_list = tokenized_kps[s]
             if not k_list:
                 continue
 
-            # Optimized: Pre-compute valid start positions for all keypoints
+            row_mask_bool = (response_mask[s] & (~cot_masks[s]))
+
+            # Compute candidate start positions
+            candidate_starts: list[int] = []
+            # Restrict to occurrences of the marker subsequence inside the response
+            resp_tokens = responses[s].tolist()
+            last_start = response_len - marker_len
+            for i in range(0, max(0, last_start + 1)):
+                if resp_tokens[i : i + marker_len] == marker_ids:
+                    # ensure the whole marker region is valid (in mask and not in CoT span)
+                    if bool(row_mask_bool[i : i + marker_len].all().item()):
+                        candidate_starts.append(i)
+
+            # Build variants for each keypoint only at candidate starts
             for k_idx, k_ids in enumerate(k_list):
                 k_len = len(k_ids)
                 if k_len == 0 or k_len > response_len:
                     continue
-
-                # Find valid start positions as contiguous, non-CoT, in-mask windows of length k_len
-                row_mask_bool = (response_mask[s] & (~cot_masks[s]))
-                valid_starts: list[int] = []
-                j = 0
-                while j < response_len:
-                    if row_mask_bool[j].item():
-                        run_start = j
-                        # advance to the end of this contiguous True run
-                        while j < response_len and row_mask_bool[j].item():
-                            j += 1
-                        run_end = j  # exclusive
-                        # enumerate all window starts fully contained in this run
-                        for start in range(run_start, run_end - k_len + 1):
-                            valid_starts.append(start)
-                    else:
-                        j += 1
-
-                for i in valid_starts:
-                    i = int(i)
-                    if i + k_len > response_len:
-                        continue
+                
+                for i in candidate_starts:
                     # Create modified copies for this variant
                     ids_mod = input_ids[s].clone()
                     resp_slice = slice(resp_start + i, resp_start + i + k_len)
@@ -548,45 +546,24 @@ class RayPPOTrainer:
         for idx, (s, k_idx, start_pos, k_len) in enumerate(variant_meta):
             key = (s, k_idx)
             if key != current_key:
-                if current_key is not None:
-                    if debug_print_variants and current_key[0] == debug_sample_idx:
-                        try:
-                            print(f"[kp] keypoint final s={current_key[0]} k={current_key[1]} p_exist={current_p_exist:.6f}")
-                        except Exception as _e:
-                            print(f"[kp] keypoint final print error: {_e}")
-                    p_exist_per_sk[current_key] = current_p_exist
                 current_key = key
                 current_p_exist = 0.0
 
-            if current_p_exist < 1.0:
-                window_lp = mod_log_probs[idx, start_pos : start_pos + k_len].sum().item()
-                # Convert to probability with numerical safety
-                p_ki = float(torch.exp(torch.tensor(window_lp)).clamp(max=1.0).item())
-                # Recurrence
-                current_p_exist = current_p_exist + (1.0 - current_p_exist) * p_ki
-                if debug_print_variants and s == debug_sample_idx:
-                    try:
-                        seg_ids = variants_responses[idx][start_pos : start_pos + k_len]
-                        seg_text = self.tokenizer.decode(seg_ids, skip_special_tokens=True)
-                    except Exception as _e:
-                        seg_text = f"<decode_error:{_e}>"
-                    try:
-                        print(
-                            f"[kp] variant s={s} k={k_idx} start={start_pos} p_ki={p_ki:.6f} cum={current_p_exist:.6f} seg='{seg_text}'"
-                        )
-                    except Exception as _e:
-                        print(f"[kp] variant print error: {_e}")
-                if current_p_exist >= 1.0:
-                    current_p_exist = 1.0
+            window_lp = mod_log_probs[idx, start_pos : start_pos + k_len].sum().item()
+            p_ki = float(torch.exp(torch.tensor(window_lp)).clamp(max=1.0).item())
+            current_p_exist = current_p_exist + (1.0 - current_p_exist) * p_ki
+            p_exist_per_sk[key] = current_p_exist
 
-        # Flush the last key
-        if current_key is not None:
-            if debug_print_variants and current_key[0] == debug_sample_idx:
+            if debug_print_variants and s == debug_sample_idx:
                 try:
-                    print(f"[kp] keypoint final s={current_key[0]} k={current_key[1]} p_exist={current_p_exist:.6f}")
+                    seg_ids = variants_responses[idx][start_pos : start_pos + k_len]
+                    seg_text = self.tokenizer.decode(seg_ids, skip_special_tokens=True)
                 except Exception as _e:
-                    print(f"[kp] keypoint final print error: {_e}")
-            p_exist_per_sk[current_key] = current_p_exist
+                    seg_text = f"<decode_error:{_e}>"
+                try:
+                    print(f"[kp] variant s={s} k={k_idx} start={start_pos} p_ki={p_ki:.6f} cum={current_p_exist:.6f} seg='{seg_text}'")
+                except Exception as _e:
+                    print(f"[kp] variant print error: {_e}")
 
         # Sum existence probability across keypoints per sample
         seq_scores = torch.zeros((bs,), dtype=torch.float32)
@@ -594,9 +571,6 @@ class RayPPOTrainer:
             total = 0.0
             # Count how many kps present for this sample
             num_k = len(tokenized_kps[s])
-            if num_k == 0:
-                seq_scores[s] = 0.0
-                continue
             for k_idx in range(num_k):
                 p_exist = p_exist_per_sk.get((s, k_idx), 0.0)
                 total += p_exist
