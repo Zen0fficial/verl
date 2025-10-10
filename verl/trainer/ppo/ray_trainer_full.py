@@ -463,11 +463,6 @@ class RayPPOTrainer:
         seq_len = input_ids.shape[1]
         resp_start = seq_len - response_len
 
-        # If a marker string is provided (default "####"), only build variants at marker positions
-        marker_string = self.config.algorithm.get("kp_marker_string", "####")
-        marker_ids = self.tokenizer.encode(marker_string, add_special_tokens=False) if marker_string else []
-        marker_len = len(marker_ids)
-
         # If enabled, only compute log_prob at the end of replacement window
         kp_end_only = bool(self.config.algorithm.get("kp_end_only", True))
 
@@ -478,16 +473,8 @@ class RayPPOTrainer:
 
             row_mask_bool = (response_mask[s] & (~cot_masks[s]))
 
-            # Compute candidate start positions
-            candidate_starts: list[int] = []
-            # Restrict to occurrences of the marker subsequence inside the response
-            resp_tokens = responses[s].tolist()
-            last_start = response_len - marker_len
-            for i in range(0, max(0, last_start + 1)):
-                if resp_tokens[i : i + marker_len] == marker_ids:
-                    # ensure the whole marker region is valid (in mask and not in CoT span)
-                    if bool(row_mask_bool[i : i + marker_len].all().item()):
-                        candidate_starts.append(i)
+            # Consider all positions; window validity will be checked per-keypoint
+            candidate_starts: list[int] = list(range(response_len))
 
             # Build variants for each keypoint only at candidate starts
             for k_idx, k_ids in enumerate(k_list):
@@ -496,11 +483,15 @@ class RayPPOTrainer:
                     continue
                 
                 for i in candidate_starts:
-                    # Create modified copies for this variant
                     # Guard against overflow: ensure the keypoint fits fully within the response window
                     if i + k_len > response_len:
                         continue
+
                     if not kp_end_only:
+                        # Require the whole window to be valid according to mask and CoT exclusion
+                        if not bool(row_mask_bool[i : i + k_len].all().item()):
+                            continue
+
                         ids_mod = input_ids[s].clone()
                         resp_slice = slice(resp_start + i, resp_start + i + k_len)
                         ids_mod[resp_slice] = torch.tensor(k_ids, dtype=ids_mod.dtype, device=ids_mod.device)
@@ -514,14 +505,15 @@ class RayPPOTrainer:
                         variants_responses.append(resp_mod)
                         variant_meta.append((s, k_idx, i, k_len))
                     else:
-                        # End-only mode: only replace the last token of the window and
-                        # set responses to a single-token response for cheap log_prob.
-                        ids_mod = input_ids[s].clone()
+                        # End-only mode: only replace the last token of the window, require that position to be valid
                         last_pos = i + k_len - 1
+                        if not bool(row_mask_bool[last_pos].item()):
+                            continue
+
+                        ids_mod = input_ids[s].clone()
                         ids_mod[resp_start + last_pos] = torch.tensor(k_ids[-1], dtype=ids_mod.dtype, device=ids_mod.device)
 
                         resp_last = torch.full((response_len,), fill_value=self.tokenizer.pad_token_id, dtype=responses.dtype, device=responses.device)
-                        # Only evaluate the last token position
                         resp_last[last_pos] = torch.tensor(k_ids[-1], dtype=responses.dtype, device=responses.device)
 
                         variants_input_ids.append(ids_mod)
