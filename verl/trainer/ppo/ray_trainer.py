@@ -558,9 +558,25 @@ class RayPPOTrainer:
         except Exception as _e:
             print(f"variants_dp debug print error: {_e}")
 
-        # Compute log-probs for the modified variants
-        mod_logprob_dp = self.actor_rollout_wg.compute_log_prob(variants_dp)
-        mod_log_probs = mod_logprob_dp.batch["old_log_probs"].to(torch.float32)  # (num_variants, response_len)
+        # Compute log-probs for the modified variants in chunks to avoid OOM/NCCL stalls
+        kp_chunk_size = int(self.config.algorithm.get("kp_variants_chunk_size", 128))
+
+        # Propagate meta_info hints to match worker expectations
+        try:
+            variants_dp.meta_info["use_dynamic_bsz"] = self.config.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
+            variants_dp.meta_info["max_token_len"] = self.config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
+            variants_dp.meta_info["micro_batch_size"] = (
+                self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
+            )
+        except Exception:
+            # Best-effort: if any field is missing in config, skip setting it here
+            pass
+
+        mod_log_probs_chunks = []
+        for dp_chunk in variants_dp.split(kp_chunk_size):
+            dp_out = self.actor_rollout_wg.compute_log_prob(dp_chunk)
+            mod_log_probs_chunks.append(dp_out.batch["old_log_probs"].to(torch.float32))
+        mod_log_probs = torch.cat(mod_log_probs_chunks, dim=0)  # (num_variants, response_len)
 
         # Aggregate probabilities per (sample, keypoint) using the recurrence
         # P_exist_i = P_exist_{i-1} + (1 - P_exist_{i-1}) * P(k, i)
