@@ -468,6 +468,9 @@ class RayPPOTrainer:
         marker_ids = self.tokenizer.encode(marker_string, add_special_tokens=False) if marker_string else []
         marker_len = len(marker_ids)
 
+        # If enabled, only compute log_prob at the end of replacement window
+        kp_end_only = bool(self.config.algorithm.get("kp_end_only", True))
+
         for s in range(bs):
             k_list = tokenized_kps[s]
             if not k_list:
@@ -494,18 +497,38 @@ class RayPPOTrainer:
                 
                 for i in candidate_starts:
                     # Create modified copies for this variant
-                    ids_mod = input_ids[s].clone()
-                    resp_slice = slice(resp_start + i, resp_start + i + k_len)
-                    ids_mod[resp_slice] = torch.tensor(k_ids, dtype=ids_mod.dtype, device=ids_mod.device)
+                    # Guard against overflow: ensure the keypoint fits fully within the response window
+                    if i + k_len > response_len:
+                        continue
+                    if not kp_end_only:
+                        ids_mod = input_ids[s].clone()
+                        resp_slice = slice(resp_start + i, resp_start + i + k_len)
+                        ids_mod[resp_slice] = torch.tensor(k_ids, dtype=ids_mod.dtype, device=ids_mod.device)
 
-                    resp_mod = responses[s].clone()
-                    resp_mod[i : i + k_len] = torch.tensor(k_ids, dtype=resp_mod.dtype, device=resp_mod.device)
+                        resp_mod = responses[s].clone()
+                        resp_mod[i : i + k_len] = torch.tensor(k_ids, dtype=resp_mod.dtype, device=resp_mod.device)
 
-                    variants_input_ids.append(ids_mod)
-                    variants_attention_mask.append(attention_mask[s].clone())
-                    variants_position_ids.append(position_ids[s].clone())
-                    variants_responses.append(resp_mod)
-                    variant_meta.append((s, k_idx, i, k_len))
+                        variants_input_ids.append(ids_mod)
+                        variants_attention_mask.append(attention_mask[s].clone())
+                        variants_position_ids.append(position_ids[s].clone())
+                        variants_responses.append(resp_mod)
+                        variant_meta.append((s, k_idx, i, k_len))
+                    else:
+                        # End-only mode: only replace the last token of the window and
+                        # set responses to a single-token response for cheap log_prob.
+                        ids_mod = input_ids[s].clone()
+                        last_pos = i + k_len - 1
+                        ids_mod[resp_start + last_pos] = torch.tensor(k_ids[-1], dtype=ids_mod.dtype, device=ids_mod.device)
+
+                        resp_last = torch.full((response_len,), fill_value=self.tokenizer.pad_token_id, dtype=responses.dtype, device=responses.device)
+                        # Only evaluate the last token position
+                        resp_last[last_pos] = torch.tensor(k_ids[-1], dtype=responses.dtype, device=responses.device)
+
+                        variants_input_ids.append(ids_mod)
+                        variants_attention_mask.append(attention_mask[s].clone())
+                        variants_position_ids.append(position_ids[s].clone())
+                        variants_responses.append(resp_last)
+                        variant_meta.append((s, k_idx, i, k_len))
 
         if len(variants_input_ids) == 0:
             # No valid windows — produce zeros
@@ -528,6 +551,13 @@ class RayPPOTrainer:
             auto_padding=True,
         )
 
+        # Debug print for variants_dp length and content
+        try:
+            print(f"variants_dp length: {len(variants_dp)}")
+            print(f"variants_dp batch: {variants_dp.batch}")
+        except Exception as _e:
+            print(f"variants_dp debug print error: {_e}")
+
         # Compute log-probs for the modified variants
         mod_logprob_dp = self.actor_rollout_wg.compute_log_prob(variants_dp)
         mod_log_probs = mod_logprob_dp.batch["old_log_probs"].to(torch.float32)  # (num_variants, response_len)
@@ -549,7 +579,12 @@ class RayPPOTrainer:
                 current_key = key
                 current_p_exist = 0.0
 
-            window_lp = mod_log_probs[idx, start_pos : start_pos + k_len].sum().item()
+            if not kp_end_only:
+                window_lp = mod_log_probs[idx, start_pos : start_pos + k_len].sum().item()
+            else:
+                # In end-only mode, only the last position has a non-pad label; others are pad
+                last_pos = start_pos + k_len - 1
+                window_lp = mod_log_probs[idx, last_pos].item()
             p_ki = float(torch.exp(torch.tensor(window_lp)).clamp(max=1.0).item())
             current_p_exist = current_p_exist + (1.0 - current_p_exist) * p_ki
             p_exist_per_sk[key] = current_p_exist
@@ -561,7 +596,8 @@ class RayPPOTrainer:
                 except Exception as _e:
                     seg_text = f"<decode_error:{_e}>"
                 try:
-                    print(f"[kp] variant s={s} k={k_idx} start={start_pos} p_ki={p_ki:.6f} cum={current_p_exist:.6f} seg='{seg_text}'")
+                    mode_str = "end" if kp_end_only else "window"
+                    print(f"[kp] variant s={s} k={k_idx} start={start_pos} mode={mode_str} p_ki={p_ki:.6f} cum={current_p_exist:.6f} seg='{seg_text}'")
                 except Exception as _e:
                     print(f"[kp] variant print error: {_e}")
 
