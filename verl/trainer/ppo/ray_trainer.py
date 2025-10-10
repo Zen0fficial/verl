@@ -548,7 +548,7 @@ class RayPPOTrainer:
                 "position_ids": var_position_ids,
                 "responses": var_responses,
             },
-            auto_padding=True,
+            auto_padding=False,
         )
 
         # Debug print for variants_dp length and content
@@ -558,8 +558,17 @@ class RayPPOTrainer:
         except Exception as _e:
             print(f"variants_dp debug print error: {_e}")
 
-        # Compute log-probs for the modified variants in chunks to avoid OOM/NCCL stalls
-        kp_chunk_size = int(self.config.algorithm.get("kp_variants_chunk_size", 128))
+        # Ensure even splitting across actor DP ranks by manually padding with duplicates
+        original_num_variants = len(variants_dp)
+        dp_size = self.actor_rollout_wg.world_size
+        remainder = original_num_variants % dp_size
+        if remainder != 0:
+            pad_needed = dp_size - remainder
+            # duplicate the last sample to pad; safe since we'll truncate after compute
+            if original_num_variants > 0:
+                pad_indices = [original_num_variants - 1] * pad_needed
+                pad_dp = variants_dp.select_idxs(pad_indices)
+                variants_dp = DataProto.concat([variants_dp, pad_dp])
 
         # Propagate meta_info hints to match worker expectations
         try:
@@ -572,11 +581,13 @@ class RayPPOTrainer:
             # Best-effort: if any field is missing in config, skip setting it here
             pass
 
-        mod_log_probs_chunks = []
-        for dp_chunk in variants_dp.split(kp_chunk_size):
-            dp_out = self.actor_rollout_wg.compute_log_prob(dp_chunk)
-            mod_log_probs_chunks.append(dp_out.batch["old_log_probs"].to(torch.float32))
-        mod_log_probs = torch.cat(mod_log_probs_chunks, dim=0)  # (num_variants, response_len)
+        # Single distributed call; internal micro-batching handles memory
+        dp_out = self.actor_rollout_wg.compute_log_prob(variants_dp)
+        mod_log_probs = dp_out.batch["old_log_probs"].to(torch.float32)
+        # Truncate to original number of variants to remove padding duplicates
+        if len(mod_log_probs) > original_num_variants:
+            mod_log_probs = mod_log_probs[:original_num_variants]
+        # shape: (num_variants, response_len)
 
         # Aggregate probabilities per (sample, keypoint) using the recurrence
         # P_exist_i = P_exist_{i-1} + (1 - P_exist_{i-1}) * P(k, i)
