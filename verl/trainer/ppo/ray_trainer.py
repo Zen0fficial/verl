@@ -382,17 +382,6 @@ class RayPPOTrainer:
         response_mask = batch.batch["response_mask"]
         bs, response_len = responses.shape
 
-        # Optional: print full decoded answers for quick monitoring
-        try:
-            valid_lens = response_mask.sum(dim=-1).tolist()
-            max_print = min(2, bs)
-            for i in range(max_print):
-                ids = responses[i][: valid_lens[i]]
-                text = self.tokenizer.decode(ids, skip_special_tokens=True)
-                print(f"[kp] full_answer[{i}]: {text}")
-        except Exception as _e:
-            print(f"[kp] full_answer decode error: {_e}")
-
         # Debug controls for printing variants and probabilities
         debug_print_variants = bool(self.config.algorithm.get("kp_debug_print_variants", False))
         debug_sample_idx = int(self.config.algorithm.get("kp_debug_sample_idx", 0))
@@ -551,13 +540,6 @@ class RayPPOTrainer:
             auto_padding=False,
         )
 
-        # Debug print for variants_dp length and content
-        try:
-            print(f"variants_dp length: {len(variants_dp)}")
-            print(f"variants_dp batch: {variants_dp.batch}")
-        except Exception as _e:
-            print(f"variants_dp debug print error: {_e}")
-
         # Ensure even splitting across actor DP ranks by manually padding with duplicates
         original_num_variants = len(variants_dp)
         dp_size = self.actor_rollout_wg.world_size
@@ -616,18 +598,6 @@ class RayPPOTrainer:
             current_p_exist = current_p_exist + (1.0 - current_p_exist) * p_ki
             p_exist_per_sk[key] = current_p_exist
 
-            if debug_print_variants and s == debug_sample_idx:
-                try:
-                    seg_ids = variants_responses[idx][start_pos : start_pos + k_len]
-                    seg_text = self.tokenizer.decode(seg_ids, skip_special_tokens=True)
-                except Exception as _e:
-                    seg_text = f"<decode_error:{_e}>"
-                try:
-                    mode_str = "end" if kp_end_only else "window"
-                    print(f"[kp] variant s={s} k={k_idx} start={start_pos} mode={mode_str} p_ki={p_ki:.6f} cum={current_p_exist:.6f} seg='{seg_text}'")
-                except Exception as _e:
-                    print(f"[kp] variant print error: {_e}")
-
         # Sum existence probability across keypoints per sample
         seq_scores = torch.zeros((bs,), dtype=torch.float32)
         for s in range(bs):
@@ -647,12 +617,6 @@ class RayPPOTrainer:
         last_idx = (response_mask.shape[1] - 1) - last_offsets
         rows = torch.arange(bs)
         token_level_scores[rows, last_idx] = seq_scores
-
-        # Print final reward for monitoring
-        try:
-            print(f"[kp] final_reward: {seq_scores.detach().cpu().tolist()}")
-        except Exception as _e:
-            print(f"[kp] final_reward print error: {_e}")
 
         reward_extra = {"kp_reward": seq_scores.detach().cpu().tolist()}
         return token_level_scores, reward_extra
@@ -1447,6 +1411,67 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        # Optionally print grouped GRPO generations: question + all answers, rewards, advantages
+                        if (
+                            self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO
+                            and bool(self.config.trainer.get("debug_print_grpo_groups", False))
+                        ):
+                            try:
+                                uid_arr = batch.non_tensor_batch.get("uid", None)
+                                prompts = batch.batch.get("prompts", None)
+                                responses = batch.batch.get("responses", None)
+                                response_mask = batch.batch["response_mask"]
+                                token_level_rewards = batch.batch["token_level_rewards"]
+                                advantages = batch.batch["advantages"]
+
+                                if uid_arr is not None and responses is not None:
+                                    expected_n = int(self.config.actor_rollout_ref.rollout.n)
+                                    max_groups = int(self.config.trainer.get("debug_print_grpo_max_groups", 1))
+
+                                    uid_to_indices = defaultdict(list)
+                                    for i, u in enumerate(uid_arr):
+                                        uid_to_indices[u].append(i)
+
+                                    groups_printed = 0
+                                    for u, idxs in uid_to_indices.items():
+                                        # only print complete groups
+                                        if len(idxs) != expected_n:
+                                            continue
+
+                                        # decode prompt if available
+                                        prompt_text = ""
+                                        if prompts is not None:
+                                            try:
+                                                prompt_ids = prompts[idxs[0]].tolist()
+                                                prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+                                            except Exception:
+                                                prompt_text = "[prompt decode error]"
+
+                                        print(f"[GRPO][step={self.global_steps}] uid={u}")
+                                        if prompt_text:
+                                            print(f"Q: {prompt_text}")
+
+                                        for j, idx in enumerate(idxs):
+                                            valid_len = int(response_mask[idx].sum().item())
+                                            resp_ids = responses[idx][:valid_len].tolist()
+                                            try:
+                                                ans_text = self.tokenizer.decode(resp_ids, skip_special_tokens=True)
+                                            except Exception:
+                                                ans_text = "[answer decode error]"
+
+                                            reward = float(token_level_rewards[idx].sum().item())
+                                            denom = max(1, int(response_mask[idx].sum().item()))
+                                            adv = float((advantages[idx] * response_mask[idx]).sum().item() / denom)
+
+                                            print(f"  A{j+1}: {ans_text}")
+                                            print(f"    reward={reward:.4f}, advantage={adv:.4f}")
+
+                                        groups_printed += 1
+                                        if groups_printed >= max_groups:
+                                            break
+                            except Exception as _e:
+                                print(f"[GRPO debug print error]: {_e}")
 
                     # update critic
                     if self.use_critic:
